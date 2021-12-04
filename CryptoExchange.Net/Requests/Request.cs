@@ -1,5 +1,6 @@
 ﻿using System;
-using System.IO;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -65,13 +66,19 @@ namespace CryptoExchange.Net.Requests
         }
 
         /// <inheritdoc />
+        public Dictionary<string, IEnumerable<string>> GetHeaders()
+        {
+            return request.Headers.ToDictionary(h => h.Key, h => h.Value);
+        }
+
+        /// <inheritdoc />
         public void SetContent(byte[] data)
         {
             request.Content = new ByteArrayContent(data);
         }
 
         /// <inheritdoc />
-        public async Task<IResponse> GetResponse(CancellationToken cancellationToken)
+        public async Task<IResponse> GetResponseAsync(CancellationToken cancellationToken)
         {
             return new Response(await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false));
         }

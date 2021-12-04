@@ -43,18 +43,28 @@ namespace CryptoExchange.Net.Interfaces
 
         /// <inheritdoc cref="SocketClientOptions.SocketSubscriptionsCombineTarget"/>
         int SocketCombineTarget { get; }
+        /// <inheritdoc cref="SocketClientOptions.MaxReconnectTries"/>
+        int? MaxReconnectTries { get; }
+        /// <inheritdoc cref="SocketClientOptions.MaxResubscribeTries"/>
+        int? MaxResubscribeTries { get; }
+        /// <inheritdoc cref="SocketClientOptions.MaxConcurrentResubscriptionsPerSocket"/>
+        int MaxConcurrentResubscriptionsPerSocket { get; }
+        /// <summary>
+        /// The current kilobytes per second of data being received by all connection from this client, averaged over the last 3 seconds
+        /// </summary>
+        double IncomingKbps { get; }
 
         /// <summary>
         /// Unsubscribe from a stream
         /// </summary>
         /// <param name="subscription">The subscription to unsubscribe</param>
         /// <returns></returns>
-        Task Unsubscribe(UpdateSubscription subscription);
+        Task UnsubscribeAsync(UpdateSubscription subscription);
 
         /// <summary>
         /// Unsubscribe all subscriptions
         /// </summary>
         /// <returns></returns>
-        Task UnsubscribeAll();
+        Task UnsubscribeAllAsync();
     }
 }

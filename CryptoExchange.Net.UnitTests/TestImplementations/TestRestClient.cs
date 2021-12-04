@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using CryptoExchange.Net.Authentication;
+using System.Collections.Generic;
 
 namespace CryptoExchange.Net.UnitTests.TestImplementations
 {
@@ -26,12 +27,17 @@ namespace CryptoExchange.Net.UnitTests.TestImplementations
             RequestFactory = new Mock<IRequestFactory>().Object;
         }
 
+        public void SetParameterPosition(HttpMethod method, HttpMethodParameterPosition position)
+        {
+            ParameterPositions[method] = position;
+        }
+
         public void SetKey(string key, string secret)
         {
             SetAuthenticationProvider(new UnitTests.TestAuthProvider(new ApiCredentials(key, secret)));
         }
 
-        public void SetResponse(string responseData, Stream requestStream = null)
+        public void SetResponse(string responseData, out IRequest requestObj)
         {
             var expectedBytes = Encoding.UTF8.GetBytes(responseData);
             var responseStream = new MemoryStream();
@@ -40,15 +46,25 @@ namespace CryptoExchange.Net.UnitTests.TestImplementations
 
             var response = new Mock<IResponse>();
             response.Setup(c => c.IsSuccessStatusCode).Returns(true);
-            response.Setup(c => c.GetResponseStream()).Returns(Task.FromResult((Stream)responseStream));
+            response.Setup(c => c.GetResponseStreamAsync()).Returns(Task.FromResult((Stream)responseStream));
             
+            var headers = new Dictionary<string, IEnumerable<string>>();
             var request = new Mock<IRequest>();
             request.Setup(c => c.Uri).Returns(new Uri("http://www.test.com"));
-            request.Setup(c => c.GetResponse(It.IsAny<CancellationToken>())).Returns(Task.FromResult(response.Object));
+            request.Setup(c => c.GetResponseAsync(It.IsAny<CancellationToken>())).Returns(Task.FromResult(response.Object));
+            request.Setup(c => c.SetContent(It.IsAny<string>(), It.IsAny<string>())).Callback(new Action<string, string>((content, type) => { request.Setup(r => r.Content).Returns(content); }));
+            request.Setup(c => c.AddHeader(It.IsAny<string>(), It.IsAny<string>())).Callback<string, string>((key, val) => headers.Add(key, new List<string> { val }));
+            request.Setup(c => c.GetHeaders()).Returns(() => headers);
 
             var factory = Mock.Get(RequestFactory);
             factory.Setup(c => c.Create(It.IsAny<HttpMethod>(), It.IsAny<string>(), It.IsAny<int>()))
+                .Callback<HttpMethod, string, int>((method, uri, id) => 
+                { 
+                    request.Setup(a => a.Uri).Returns(new Uri(uri));
+                    request.Setup(a => a.Method).Returns(method); 
+                })
                 .Returns(request.Object);
+            requestObj = request.Object;
         }
 
         public void SetErrorWithoutResponse(HttpStatusCode code, string message)
@@ -57,7 +73,7 @@ namespace CryptoExchange.Net.UnitTests.TestImplementations
             typeof(HttpRequestException).GetField("_message", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).SetValue(we, message);
            
             var request = new Mock<IRequest>();
-            request.Setup(c => c.GetResponse(It.IsAny<CancellationToken>())).Throws(we);
+            request.Setup(c => c.GetResponseAsync(It.IsAny<CancellationToken>())).Throws(we);
 
             var factory = Mock.Get(RequestFactory);
             factory.Setup(c => c.Create(It.IsAny<HttpMethod>(), It.IsAny<string>(), It.IsAny<int>()))
@@ -73,20 +89,29 @@ namespace CryptoExchange.Net.UnitTests.TestImplementations
 
             var response = new Mock<IResponse>();
             response.Setup(c => c.IsSuccessStatusCode).Returns(false);
-            response.Setup(c => c.GetResponseStream()).Returns(Task.FromResult((Stream)responseStream));
+            response.Setup(c => c.GetResponseStreamAsync()).Returns(Task.FromResult((Stream)responseStream));
 
+            var headers = new Dictionary<string, IEnumerable<string>>();
             var request = new Mock<IRequest>();
             request.Setup(c => c.Uri).Returns(new Uri("http://www.test.com"));
-            request.Setup(c => c.GetResponse(It.IsAny<CancellationToken>())).Returns(Task.FromResult(response.Object));
+            request.Setup(c => c.GetResponseAsync(It.IsAny<CancellationToken>())).Returns(Task.FromResult(response.Object));
+            request.Setup(c => c.AddHeader(It.IsAny<string>(), It.IsAny<string>())).Callback<string, string>((key, val) => headers.Add(key, new List<string> { val }));
+            request.Setup(c => c.GetHeaders()).Returns(headers);
 
             var factory = Mock.Get(RequestFactory);
             factory.Setup(c => c.Create(It.IsAny<HttpMethod>(), It.IsAny<string>(), It.IsAny<int>()))
+                .Callback<HttpMethod, string, int>((method, uri, id) => request.Setup(a => a.Uri).Returns(new Uri(uri)))
                 .Returns(request.Object);
         }
 
         public async Task<CallResult<T>> Request<T>(CancellationToken ct = default) where T:class
         {
-            return await SendRequest<T>(new Uri("http://www.test.com"), HttpMethod.Get, ct);
+            return await SendRequestAsync<T>(new Uri("http://www.test.com"), HttpMethod.Get, ct);
+        }
+
+        public async Task<CallResult<T>> RequestWithParams<T>(HttpMethod method, Dictionary<string, object> parameters, Dictionary<string, string> headers) where T : class
+        {
+            return await SendRequestAsync<T>(new Uri("http://www.test.com"), method, default, parameters, additionalHeaders: headers);
         }
     }
 

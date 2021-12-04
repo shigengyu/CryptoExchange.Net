@@ -2,14 +2,14 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
-using System.Net;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web;
 using CryptoExchange.Net.Logging;
 using CryptoExchange.Net.Objects;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -37,9 +37,33 @@ namespace CryptoExchange.Net
         /// <param name="parameters"></param>
         /// <param name="key"></param>
         /// <param name="value"></param>
+        /// <param name="converter"></param>
+        public static void AddParameter(this Dictionary<string, object> parameters, string key, string value, JsonConverter converter)
+        {
+            parameters.Add(key, JsonConvert.SerializeObject(value, converter));
+        }
+
+        /// <summary>
+        /// Add a parameter
+        /// </summary>
+        /// <param name="parameters"></param>
+        /// <param name="key"></param>
+        /// <param name="value"></param>
         public static void AddParameter(this Dictionary<string, object> parameters, string key, object value)
         {
             parameters.Add(key, value);
+        }
+
+        /// <summary>
+        /// Add a parameter
+        /// </summary>
+        /// <param name="parameters"></param>
+        /// <param name="key"></param>
+        /// <param name="value"></param>
+        /// <param name="converter"></param>
+        public static void AddParameter(this Dictionary<string, object> parameters, string key, object value, JsonConverter converter)
+        {
+            parameters.Add(key, JsonConvert.SerializeObject(value, converter));
         }
 
         /// <summary>
@@ -60,10 +84,36 @@ namespace CryptoExchange.Net
         /// <param name="parameters"></param>
         /// <param name="key"></param>
         /// <param name="value"></param>
+        /// <param name="converter"></param>
+        public static void AddOptionalParameter(this Dictionary<string, object> parameters, string key, object? value, JsonConverter converter)
+        {
+            if (value != null)
+                parameters.Add(key, JsonConvert.SerializeObject(value, converter));
+        }
+
+        /// <summary>
+        /// Add an optional parameter. Not added if value is null
+        /// </summary>
+        /// <param name="parameters"></param>
+        /// <param name="key"></param>
+        /// <param name="value"></param>
         public static void AddOptionalParameter(this Dictionary<string, string> parameters, string key, string? value)
         {
             if (value != null)
                 parameters.Add(key, value);
+        }
+
+        /// <summary>
+        /// Add an optional parameter. Not added if value is null
+        /// </summary>
+        /// <param name="parameters"></param>
+        /// <param name="key"></param>
+        /// <param name="value"></param>
+        /// <param name="converter"></param>
+        public static void AddOptionalParameter(this Dictionary<string, string> parameters, string key, string? value, JsonConverter converter)
+        {
+            if (value != null)
+                parameters.Add(key, JsonConvert.SerializeObject(value, converter));
         }
 
         /// <summary>
@@ -75,7 +125,7 @@ namespace CryptoExchange.Net
         /// <returns></returns>
         public static string CreateParamString(this Dictionary<string, object> parameters, bool urlEncodeValues, ArrayParametersSerialization serializationType)
         {
-            var uriString = "";
+            var uriString = string.Empty;
             var arraysParameters = parameters.Where(p => p.Value.GetType().IsArray).ToList();
             foreach (var arrayEntry in arraysParameters)
             {
@@ -142,49 +192,6 @@ namespace CryptoExchange.Net
         }
 
         /// <summary>
-        /// Wait one async
-        /// </summary>
-        /// <param name="handle"></param>
-        /// <param name="millisecondsTimeout"></param>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        public static async Task<bool> WaitOneAsync(this WaitHandle handle, int millisecondsTimeout, CancellationToken cancellationToken)
-        {
-            RegisteredWaitHandle? registeredHandle = null;
-            CancellationTokenRegistration tokenRegistration = default;
-            try
-            {
-                var tcs = new TaskCompletionSource<bool>();
-                registeredHandle = ThreadPool.RegisterWaitForSingleObject(
-                    handle,
-                    (state, timedOut) => ((TaskCompletionSource<bool>)state).TrySetResult(!timedOut),
-                    tcs,
-                    millisecondsTimeout,
-                    true);
-                tokenRegistration = cancellationToken.Register(
-                    state => ((TaskCompletionSource<bool>)state).TrySetCanceled(),
-                    tcs);
-                return await tcs.Task.ConfigureAwait(false);
-            }
-            finally
-            {
-                registeredHandle?.Unregister(null);
-                tokenRegistration.Dispose();
-            }
-        }
-
-        /// <summary>
-        /// Wait one async
-        /// </summary>
-        /// <param name="handle"></param>
-        /// <param name="timeout"></param>
-        /// <returns></returns>
-        public static Task<bool> WaitOneAsync(this WaitHandle handle, TimeSpan timeout)
-        {
-            return handle.WaitOneAsync((int)timeout.TotalMilliseconds, CancellationToken.None);
-        }
-
-        /// <summary>
         /// String to JToken
         /// </summary>
         /// <param name="stringData"></param>
@@ -202,14 +209,14 @@ namespace CryptoExchange.Net
             catch (JsonReaderException jre)
             {
                 var info = $"Deserialize JsonReaderException: {jre.Message}, Path: {jre.Path}, LineNumber: {jre.LineNumber}, LinePosition: {jre.LinePosition}. Data: {stringData}";
-                log?.Write(LogVerbosity.Error, info);
+                log?.Write(LogLevel.Error, info);
                 if (log == null) Debug.WriteLine(info);
                 return null;
             }
             catch (JsonSerializationException jse)
             {
                 var info = $"Deserialize JsonSerializationException: {jse.Message}. Data: {stringData}";
-                log?.Write(LogVerbosity.Error, info);
+                log?.Write(LogLevel.Error, info);
                 if (log == null) Debug.WriteLine(info);
                 return null;
             }
@@ -254,6 +261,17 @@ namespace CryptoExchange.Net
         }
 
         /// <summary>
+        /// Validates a string is null or not empty
+        /// </summary>
+        /// <param name="value"></param>
+        /// <param name="argumentName"></param>
+        public static void ValidateNullOrNotEmpty(this string value, string argumentName)
+        {
+            if (value != null && string.IsNullOrEmpty(value))
+                throw new ArgumentException($"No value provided for parameter {argumentName}", argumentName);
+        }
+
+        /// <summary>
         /// Validates an object is not null
         /// </summary>
         /// <param name="value">The value of the object</param>
@@ -273,6 +291,33 @@ namespace CryptoExchange.Net
         {
             if (value == null || !value.Any())
                 throw new ArgumentException($"No values provided for parameter {argumentName}", argumentName);
+        }
+
+        /// <summary>
+        /// Format an exception and inner exception to a readable string
+        /// </summary>
+        /// <param name="exception"></param>
+        /// <returns></returns>
+        public static string ToLogString(this Exception exception)
+        {
+            var message = new StringBuilder();
+            var indent = 0;
+            while (exception != null)
+            {
+                for (var i = 0; i < indent; i++)
+                    message.Append(' ');
+                message.Append(exception.GetType().Name);
+                message.Append(" - ");
+                message.AppendLine(exception.Message);
+                for (var i = 0; i < indent; i++)
+                    message.Append(' ');
+                message.AppendLine(exception.StackTrace);
+
+                indent += 2;
+                exception = exception.InnerException;
+            }
+
+            return message.ToString();
         }
     }
 }

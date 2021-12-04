@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using CryptoExchange.Net.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Microsoft.Extensions.Logging;
+using CryptoExchange.Net.Objects;
 
 namespace CryptoExchange.Net.Sockets
 {
@@ -20,6 +22,10 @@ namespace CryptoExchange.Net.Sockets
         /// Connection lost event
         /// </summary>
         public event Action? ConnectionLost;
+        /// <summary>
+        /// Connection closed and no reconnect is happening
+        /// </summary>
+        public event Action? ConnectionClosed;
         /// <summary>
         /// Connecting restored event
         /// </summary>
@@ -42,12 +48,12 @@ namespace CryptoExchange.Net.Sockets
         public event Action<JToken>? UnhandledMessage;
 
         /// <summary>
-        /// The amount of handlers
+        /// The amount of subscriptions on this connection
         /// </summary>
-        public int HandlerCount
+        public int SubscriptionCount
         {
-            get { lock (handlersLock)
-                return handlers.Count(h => h.UserSubscription); }
+            get { lock (subscriptionLock)
+                return subscriptions.Count(h => h.UserSubscription); }
         }
 
         /// <summary>
@@ -60,14 +66,21 @@ namespace CryptoExchange.Net.Sockets
         public bool Connected { get; private set; }
 
         /// <summary>
-        /// The socket
+        /// The underlying socket
         /// </summary>
         public IWebsocket Socket { get; set; }
         /// <summary>
-        /// If should reconnect upon closing
+        /// If the socket should be reconnected upon closing
         /// </summary>
         public bool ShouldReconnect { get; set; }
-
+        /// <summary>
+        /// Current reconnect try
+        /// </summary>
+        public int ReconnectTry { get; set; }
+        /// <summary>
+        /// Current resubscribe try
+        /// </summary>
+        public int ResubscribeTry { get; set; }
         /// <summary>
         /// Time of disconnecting
         /// </summary>
@@ -84,7 +97,7 @@ namespace CryptoExchange.Net.Sockets
                 if (pausedActivity != value)
                 {
                     pausedActivity = value;
-                    log.Write(LogVerbosity.Debug, "Paused activity: " + value);
+                    log.Write(LogLevel.Debug, $"Socket {Socket.Id} Paused activity: " + value);
                     if(pausedActivity) ActivityPaused?.Invoke();
                     else ActivityUnpaused?.Invoke();
                 }
@@ -92,8 +105,8 @@ namespace CryptoExchange.Net.Sockets
         }
 
         private bool pausedActivity;
-        private readonly List<SocketSubscription> handlers;
-        private readonly object handlersLock = new object();
+        private readonly List<SocketSubscription> subscriptions;
+        private readonly object subscriptionLock = new object();
 
         private bool lostTriggered;
         private readonly Log log;
@@ -113,33 +126,23 @@ namespace CryptoExchange.Net.Sockets
 
             pendingRequests = new List<PendingRequest>();
 
-            handlers = new List<SocketSubscription>();
+            subscriptions = new List<SocketSubscription>();
             Socket = socket;
 
             Socket.Timeout = client.SocketNoDataTimeout;
             Socket.OnMessage += ProcessMessage;
-            Socket.OnClose += () =>
-            {
-                if (lostTriggered)
-                    return;
-
-                DisconnectTime = DateTime.UtcNow;
-                lostTriggered = true;
-                
-                if (ShouldReconnect)
-                    ConnectionLost?.Invoke();
-            };
             Socket.OnClose += SocketOnClose;
-            Socket.OnOpen += () =>
-            {
-                PausedActivity = false;
-                Connected = true;
-            };
+            Socket.OnOpen += SocketOnOpen;
         }
         
+        /// <summary>
+        /// Process a message received by the socket
+        /// </summary>
+        /// <param name="data"></param>
         private void ProcessMessage(string data)
         {
-            log.Write(LogVerbosity.Debug, $"Socket {Socket.Id} received data: " + data);
+            var timestamp = DateTime.UtcNow;
+            log.Write(LogLevel.Trace, $"Socket {Socket.Id} received data: " + data);
             if (string.IsNullOrEmpty(data)) return;
 
             var tokenData = data.ToJToken(log);
@@ -153,101 +156,122 @@ namespace CryptoExchange.Net.Sockets
 
             var handledResponse = false;
             PendingRequest[] requests;
-            lock(pendingRequests)
-			{
+            lock(pendingRequests)			
                 requests = pendingRequests.ToArray();
-			}
+
+            // Remove any timed out requests
+            foreach (var request in requests.Where(r => r.Completed))
+            {
+                lock (pendingRequests)
+                    pendingRequests.Remove(request);
+            }
+
+            // Check if this message is an answer on any pending requests
             foreach (var pendingRequest in requests)
             {
-                if (pendingRequest.Check(tokenData))
+                if (pendingRequest.CheckData(tokenData))
                 {
-                    lock (pendingRequests)
-                    {
+                    lock (pendingRequests)                    
                         pendingRequests.Remove(pendingRequest);
-                    }
-                    if (pendingRequest.Result == null)
-					{
-                        continue; // A previous timeout.
-					}
+
                     if (!socketClient.ContinueOnQueryResponse)
                         return;
+
                     handledResponse = true;
                     break;
                 }
             }
-            
-            if (!HandleData(tokenData) && !handledResponse)
+
+            // Message was not a request response, check data handlers
+            var messageEvent = new MessageEvent(this, tokenData, socketClient.OutputOriginalData ? data: null, timestamp);
+            if (!HandleData(messageEvent) && !handledResponse)
             {
-                log.Write(LogVerbosity.Warning, "Message not handled: " + tokenData);
+                if (!socketClient.UnhandledMessageExpected)
+                    log.Write(LogLevel.Warning, $"Socket {Socket.Id} Message not handled: " + tokenData);
                 UnhandledMessage?.Invoke(tokenData);
             }
         }
 
         /// <summary>
-        /// Add handler
+        /// Add subscription to this connection
         /// </summary>
-        /// <param name="handler"></param>
-        public void AddHandler(SocketSubscription handler)
+        /// <param name="subscription"></param>
+        public void AddSubscription(SocketSubscription subscription)
         {
-            lock(handlersLock)
-                handlers.Add(handler);
+            lock(subscriptionLock)
+                subscriptions.Add(subscription);
         }
 
-        private bool HandleData(JToken tokenData)
+        /// <summary>
+        /// Get a subscription on this connection
+        /// </summary>
+        /// <param name="id"></param>
+        public SocketSubscription GetSubscription(int id)
+        {
+            lock (subscriptionLock)
+                return subscriptions.SingleOrDefault(s => s.Id == id);
+        }
+
+        private bool HandleData(MessageEvent messageEvent)
         {
             SocketSubscription? currentSubscription = null;
             try
             { 
                 var handled = false;
                 var sw = Stopwatch.StartNew();
-                lock (handlersLock)
+
+                // Loop the subscriptions to check if any of them signal us that the message is for them
+                List<SocketSubscription> subscriptionsCopy;
+                lock (subscriptionLock)
+                    subscriptionsCopy = subscriptions.ToList();
+
+                foreach (var subscription in subscriptionsCopy)
                 {
-                    foreach (var handler in handlers.ToList())
+                    currentSubscription = subscription;
+                    if (subscription.Request == null)
                     {
-                        currentSubscription = handler;
-                        if (handler.Request == null)
+                        if (socketClient.MessageMatchesHandler(messageEvent.JsonData, subscription.Identifier!))
                         {
-                            if (socketClient.MessageMatchesHandler(tokenData, handler.Identifier!))
-                            {
-                                handled = true;
-                                handler.MessageHandler(this, tokenData);
-                            }
+                            handled = true;
+                            subscription.MessageHandler(messageEvent);
                         }
-                        else
+                    }
+                    else
+                    {
+                        if (socketClient.MessageMatchesHandler(messageEvent.JsonData, subscription.Request))
                         {
-                            if (socketClient.MessageMatchesHandler(tokenData, handler.Request))
-                            {
-                                handled = true;
-                                tokenData = socketClient.ProcessTokenData(tokenData);
-                                handler.MessageHandler(this, tokenData);
-                            }
+                            handled = true;
+                            messageEvent.JsonData = socketClient.ProcessTokenData(messageEvent.JsonData);
+                            subscription.MessageHandler(messageEvent);
                         }
                     }
                 }
-
+                
                 sw.Stop();
                 if (sw.ElapsedMilliseconds > 500)
-                    log.Write(LogVerbosity.Warning, $"Socket {Socket.Id} message processing slow ({sw.ElapsedMilliseconds}ms), consider offloading data handling to another thread. " +
+                    log.Write(LogLevel.Warning, $"Socket {Socket.Id} message processing slow ({sw.ElapsedMilliseconds}ms), consider offloading data handling to another thread. " +
                                                     "Data from this socket may arrive late or not at all if message processing is continuously slow.");
+                else
+                    log.Write(LogLevel.Trace, $"Socket {Socket.Id} message processed in {sw.ElapsedMilliseconds}ms");
                 return handled;
             }
             catch (Exception ex)
             {
-                log.Write(LogVerbosity.Error, $"Socket {Socket.Id} Exception during message processing\r\nException: {ex}\r\nData: {tokenData}");
+                log.Write(LogLevel.Error, $"Socket {Socket.Id} Exception during message processing\r\nException: {ex.ToLogString()}\r\nData: {messageEvent.JsonData}");
                 currentSubscription?.InvokeExceptionHandler(ex);
                 return false;
             }
         }
 
         /// <summary>
-        /// Send data
+        /// Send data and wait for an answer
         /// </summary>
-        /// <typeparam name="T">The data type</typeparam>
+        /// <typeparam name="T">The data type expected in response</typeparam>
         /// <param name="obj">The object to send</param>
         /// <param name="timeout">The timeout for response</param>
         /// <param name="handler">The response handler</param>
         /// <returns></returns>
-        public virtual Task SendAndWait<T>(T obj, TimeSpan timeout, Func<JToken, bool> handler)
+        public virtual Task SendAndWaitAsync<T>(T obj, TimeSpan timeout, Func<JToken, bool> handler)
         {
             var pending = new PendingRequest(handler, timeout);
             lock (pendingRequests)
@@ -255,11 +279,11 @@ namespace CryptoExchange.Net.Sockets
                 pendingRequests.Add(pending);
             }
             Send(obj);
-            return pending.Event.WaitOneAsync(timeout);
+            return pending.Event.WaitAsync(timeout);
         }
 
         /// <summary>
-        /// Send data to the websocket
+        /// Send data over the websocket connection
         /// </summary>
         /// <typeparam name="T">The type of the object to send</typeparam>
         /// <param name="obj">The object to send</param>
@@ -273,13 +297,23 @@ namespace CryptoExchange.Net.Sockets
         }
 
         /// <summary>
-        /// Send string data to the websocket
+        /// Send string data over the websocket connection
         /// </summary>
         /// <param name="data">The data to send</param>
         public virtual void Send(string data)
         {
-            log.Write(LogVerbosity.Debug, $"Socket {Socket.Id} sending data: {data}");
+            log.Write(LogLevel.Debug, $"Socket {Socket.Id} sending data: {data}");
             Socket.Send(data);
+        }
+
+        /// <summary>
+        /// Handler for a socket opening
+        /// </summary>
+        protected virtual void SocketOnOpen()
+        {
+            ReconnectTry = 0;
+            PausedActivity = false;
+            Connected = true;
         }
 
         /// <summary>
@@ -287,6 +321,15 @@ namespace CryptoExchange.Net.Sockets
         /// </summary>
         protected virtual void SocketOnClose()
         {
+            lock (pendingRequests)
+            {
+                foreach(var pendingRequest in pendingRequests.ToList())
+                {
+                    pendingRequest.Fail();
+                    pendingRequests.Remove(pendingRequest);
+                }
+            }
+
             if (socketClient.AutoReconnect && ShouldReconnect)
             {
                 if (Socket.Reconnecting)
@@ -294,11 +337,19 @@ namespace CryptoExchange.Net.Sockets
 
                 Socket.Reconnecting = true;
 
-                log.Write(LogVerbosity.Info, $"Socket {Socket.Id} Connection lost, will try to reconnect after {socketClient.ReconnectInterval}");
+                DisconnectTime = DateTime.UtcNow;
+                log.Write(LogLevel.Information, $"Socket {Socket.Id} Connection lost, will try to reconnect after {socketClient.ReconnectInterval}");
+                if (!lostTriggered)
+                {
+                    lostTriggered = true;
+                    ConnectionLost?.Invoke();
+                }
+
                 Task.Run(async () =>
                 {
                     while (ShouldReconnect)
                     {
+                        // Wait a bit before attempting reconnect
                         await Task.Delay(socketClient.ReconnectInterval).ConfigureAwait(false);
                         if (!ShouldReconnect)
                         {
@@ -308,26 +359,67 @@ namespace CryptoExchange.Net.Sockets
                         }
 
                         Socket.Reset();
-                        if (!await Socket.Connect().ConfigureAwait(false))
+                        if (!await Socket.ConnectAsync().ConfigureAwait(false))
                         {
-                            log.Write(LogVerbosity.Debug, $"Socket {Socket.Id} failed to reconnect");
+                            ReconnectTry++;
+                            ResubscribeTry = 0;
+                            if (socketClient.MaxReconnectTries != null
+                            && ReconnectTry >= socketClient.MaxReconnectTries)
+                            {
+                                log.Write(LogLevel.Debug, $"Socket {Socket.Id} failed to reconnect after {ReconnectTry} tries, closing");
+                                ShouldReconnect = false;
+
+                                if (socketClient.sockets.ContainsKey(Socket.Id))
+                                    socketClient.sockets.TryRemove(Socket.Id, out _);
+
+                                Closed?.Invoke();
+                                _ = Task.Run(() => ConnectionClosed?.Invoke());
+                                break;
+                            }
+
+                            log.Write(LogLevel.Debug, $"Socket {Socket.Id} failed to reconnect{(socketClient.MaxReconnectTries != null ? $", try {ReconnectTry}/{socketClient.MaxReconnectTries}": "")}");
                             continue;
                         }
 
+                        // Successfully reconnected
                         var time = DisconnectTime;
                         DisconnectTime = null;
 
-                        log.Write(LogVerbosity.Info, $"Socket {Socket.Id} reconnected after {DateTime.UtcNow - time}");
+                        log.Write(LogLevel.Information, $"Socket {Socket.Id} reconnected after {DateTime.UtcNow - time}");
 
-                        var reconnectResult = await ProcessReconnect().ConfigureAwait(false);
+                        var reconnectResult = await ProcessReconnectAsync().ConfigureAwait(false);
                         if (!reconnectResult)
-                            await Socket.Close().ConfigureAwait(false);
+                        {
+                            ResubscribeTry++;
+
+                            if (socketClient.MaxResubscribeTries != null &&
+                            ResubscribeTry >= socketClient.MaxResubscribeTries)
+                            {
+                                log.Write(LogLevel.Debug, $"Socket {Socket.Id} failed to resubscribe after {ResubscribeTry} tries, closing");
+                                ShouldReconnect = false;
+
+                                if (socketClient.sockets.ContainsKey(Socket.Id))
+                                    socketClient.sockets.TryRemove(Socket.Id, out _);
+
+                                Closed?.Invoke();
+                                _ = Task.Run(() => ConnectionClosed?.Invoke());
+                            }
+                            else
+                                log.Write(LogLevel.Debug, $"Socket {Socket.Id} resubscribing all subscriptions failed on reconnected socket{(socketClient.MaxResubscribeTries != null ? $", try {ResubscribeTry}/{socketClient.MaxResubscribeTries}" : "")}. Disconnecting and reconnecting.");
+
+                            if (Socket.IsOpen)                            
+                                await Socket.CloseAsync().ConfigureAwait(false);                            
+                            else
+                                DisconnectTime = DateTime.UtcNow;
+                        }
                         else
                         {
+                            log.Write(LogLevel.Debug, $"Socket {Socket.Id} data connection restored.");
+                            ResubscribeTry = 0;
                             if (lostTriggered)
                             {
                                 lostTriggered = false;
-                                InvokeConnectionRestored();
+                                InvokeConnectionRestored(time);
                             }
 
                             break;
@@ -339,96 +431,123 @@ namespace CryptoExchange.Net.Sockets
             }
             else
             {
-                log.Write(LogVerbosity.Info, $"Socket {Socket.Id} closed");
+                if (!socketClient.AutoReconnect && ShouldReconnect)
+                    _ = Task.Run(() => ConnectionClosed?.Invoke());
+
+                // No reconnecting needed
+                log.Write(LogLevel.Information, $"Socket {Socket.Id} closed");
                 if (socketClient.sockets.ContainsKey(Socket.Id))
                     socketClient.sockets.TryRemove(Socket.Id, out _);
 
-                Socket.Dispose();
                 Closed?.Invoke();
             }
         }
 
-        private async void InvokeConnectionRestored()
+        private async void InvokeConnectionRestored(DateTime? disconnectTime)
         {
-            await Task.Run(() => ConnectionRestored?.Invoke(DisconnectTime.HasValue ? DateTime.UtcNow - DisconnectTime.Value : TimeSpan.FromSeconds(0))).ConfigureAwait(false);
+            await Task.Run(() => ConnectionRestored?.Invoke(disconnectTime.HasValue ? DateTime.UtcNow - disconnectTime.Value : TimeSpan.FromSeconds(0))).ConfigureAwait(false);
         }
 
-        private async Task<bool> ProcessReconnect()
+        private async Task<bool> ProcessReconnectAsync()
         {
             if (Authenticated)
             {
-                var authResult = await socketClient.AuthenticateSocket(this).ConfigureAwait(false);
+                if (!Socket.IsOpen)
+                    return false;
+
+                // If we reconnected a authenticated connection we need to re-authenticate
+                var authResult = await socketClient.AuthenticateSocketAsync(this).ConfigureAwait(false);
                 if (!authResult)
                 {
-                    log.Write(LogVerbosity.Info, "Authentication failed on reconnected socket. Disconnecting and reconnecting.");
+                    log.Write(LogLevel.Information, $"Socket {Socket.Id} authentication failed on reconnected socket. Disconnecting and reconnecting.");
                     return false;
                 }
 
-                log.Write(LogVerbosity.Debug, "Authentication succeeded on reconnected socket.");
+                log.Write(LogLevel.Debug, $"Socket {Socket.Id} authentication succeeded on reconnected socket.");
             }
 
-            List<SocketSubscription> handlerList;
-            lock (handlersLock)
-                handlerList = handlers.Where(h => h.Request != null).ToList();
+            // Get a list of all subscriptions on the socket
+            List<SocketSubscription> subscriptionList;
+            lock (subscriptionLock)
+                subscriptionList = subscriptions.Where(h => h.Request != null).ToList();
 
-            var success = true;
-            var taskList = new List<Task>();
-            foreach (var handler in handlerList)
+            // Foreach subscription which is subscribed by a subscription request we will need to resend that request to resubscribe
+            for (var i = 0; i < subscriptionList.Count; i += socketClient.MaxConcurrentResubscriptionsPerSocket)
             {
-                var task = socketClient.SubscribeAndWait(this, handler.Request!, handler).ContinueWith(t =>
+                var success = true;
+                var taskList = new List<Task>();
+                foreach (var subscription in subscriptionList.Skip(i).Take(socketClient.MaxConcurrentResubscriptionsPerSocket))
                 {
-                    if (!t.Result)
-                        success = false;
-                });
-                taskList.Add(task);
-            }
+                    if (!Socket.IsOpen)
+                        continue;
 
-            Task.WaitAll(taskList.ToArray());
-            if (!success)
-            {
-                log.Write(LogVerbosity.Debug, "Resubscribing all subscriptions failed on reconnected socket. Disconnecting and reconnecting.");
-                return false;
-            }
+                    var task = socketClient.SubscribeAndWaitAsync(this, subscription.Request!, subscription).ContinueWith(t =>
+                    {
+                        if (!t.Result)
+                            success = false;
+                    });
+                    taskList.Add(task);
+                }
 
-            log.Write(LogVerbosity.Debug, "All subscription successfully resubscribed on reconnected socket.");
+                await Task.WhenAll(taskList).ConfigureAwait(false);
+                if (!success || !Socket.IsOpen)
+                    return false;
+            }        
+
+            log.Write(LogLevel.Debug, $"Socket {Socket.Id} all subscription successfully resubscribed on reconnected socket.");
             return true;
+        }
+
+        internal async Task UnsubscribeAsync(SocketSubscription socketSubscription)
+        {
+            await socketClient.UnsubscribeAsync(this, socketSubscription).ConfigureAwait(false);
+        }
+
+        internal async Task<CallResult<bool>> ResubscribeAsync(SocketSubscription socketSubscription)
+        {
+            if (!Socket.IsOpen)
+                return new CallResult<bool>(false, new UnknownError("Socket is not connected"));
+
+            return await socketClient.SubscribeAndWaitAsync(this, socketSubscription.Request!, socketSubscription).ConfigureAwait(false);
         }
         
         /// <summary>
         /// Close the connection
         /// </summary>
         /// <returns></returns>
-        public async Task Close()
+        public async Task CloseAsync()
         {
             Connected = false;
             ShouldReconnect = false;
             if (socketClient.sockets.ContainsKey(Socket.Id))
                 socketClient.sockets.TryRemove(Socket.Id, out _);
             
-            await Socket.Close().ConfigureAwait(false);
+            await Socket.CloseAsync().ConfigureAwait(false);
             Socket.Dispose();
         }
 
         /// <summary>
-        /// Close the subscription
+        /// Close a subscription on this connection. If all subscriptions on this connection are closed the connection gets closed as well
         /// </summary>
         /// <param name="subscription">Subscription to close</param>
         /// <returns></returns>
-        public async Task Close(SocketSubscription subscription)
+        public async Task CloseAsync(SocketSubscription subscription)
         {
+            if (!Socket.IsOpen)
+                return;
+
             if (subscription.Confirmed)
-                await socketClient.Unsubscribe(this, subscription).ConfigureAwait(false);
+                await socketClient.UnsubscribeAsync(this, subscription).ConfigureAwait(false);
 
-            var shouldCloseWrapper = false;
-            lock (handlersLock)
-            {
-                handlers.Remove(subscription);
-                if (handlers.Count(r => r.UserSubscription) == 0)
-                    shouldCloseWrapper = true;
-            }
+            var shouldCloseConnection = false;
+            lock (subscriptionLock)
+                shouldCloseConnection = !subscriptions.Any(r => r.UserSubscription && subscription != r);
 
-            if (shouldCloseWrapper)
-                await Close().ConfigureAwait(false);
+            if (shouldCloseConnection)
+                await CloseAsync().ConfigureAwait(false);
+
+            lock (subscriptionLock)
+                subscriptions.Remove(subscription);            
         }
     }
 
@@ -436,36 +555,39 @@ namespace CryptoExchange.Net.Sockets
     {
         public Func<JToken, bool> Handler { get; }
         public JToken? Result { get; private set; }
-        public ManualResetEvent Event { get; }
+        public bool Completed { get; private set; }
+        public AsyncResetEvent Event { get; }
         public TimeSpan Timeout { get; }
 
-        private readonly DateTime startTime;
+        private CancellationTokenSource cts;
 
         public PendingRequest(Func<JToken, bool> handler, TimeSpan timeout)
         {
             Handler = handler;
-            Event = new ManualResetEvent(false);
+            Event = new AsyncResetEvent(false, false);
             Timeout = timeout;
-            startTime = DateTime.UtcNow;
+
+            cts = new CancellationTokenSource(timeout);
+            cts.Token.Register(Fail, false);
         }
 
-        public bool Check(JToken data)
+        public bool CheckData(JToken data)
         {
             if (Handler(data))
             {
                 Result = data;
+                Completed = true;
                 Event.Set();
                 return true;
-            }
-
-            if (DateTime.UtcNow - startTime > Timeout)
-            {
-                // Timed out
-                Event.Set();
-                return true;
-            }
+            }            
 
             return false;
+        }
+
+        public void Fail()
+        {
+            Completed = true;
+            Event.Set();
         }
     }
 }

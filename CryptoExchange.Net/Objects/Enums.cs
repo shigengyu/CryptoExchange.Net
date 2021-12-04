@@ -16,16 +16,16 @@
     }
 
     /// <summary>
-    /// Where the post parameters should be added
+    /// Where the parameters for a HttpMethod should be added in a request
     /// </summary>
-    public enum PostParameters
+    public enum HttpMethodParameterPosition
     {
         /// <summary>
-        /// Post parameters in body
+        /// Parameters in body
         /// </summary>
         InBody,
         /// <summary>
-        /// Post parameters in url
+        /// Parameters in url
         /// </summary>
         InUri
     }
@@ -100,5 +100,20 @@
         /// Create an []=value array
         /// </summary>
         Array
+    }
+
+    /// <summary>
+    /// How to round
+    /// </summary>
+    public enum RoundingType
+    {
+        /// <summary>
+        /// Round down (flooring)
+        /// </summary>
+        Down,
+        /// <summary>
+        /// Round to closest value
+        /// </summary>
+        Closest
     }
 }
